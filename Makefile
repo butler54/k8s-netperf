@@ -3,6 +3,7 @@
 #
 #   - all (default) - builds all targets
 #   - build - builds k8s-netperf binary
+#   - build-linux-amd64 - builds a Linux AMD64 binary
 #   - container-build - builds the container image 
 #	- gha-build	- build multi-architecture container image
 #	- gha-push - Push the image & manifest
@@ -42,11 +43,15 @@ VERSION = $(shell branch="$$(git rev-parse --abbrev-ref HEAD)"; \
 		echo "$$branch"; \
 	fi)
 
-.PHONY: all build container-build gha-build gha-push clean verify verify-ci verify-fast verify-go verify-gofmt update-gofmt verify-golangci test
+.PHONY: all build build-linux-amd64 container-build gha-build gha-push clean verify verify-ci verify-fast verify-go verify-gofmt update-gofmt verify-golangci test
 
 all: build container-build
 
 build: $(BIN_PATH)
+
+build-linux-amd64:
+	@mkdir -p bin/linux/amd64
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=$(CGO) go build -v -ldflags "-X $(CMD_VERSION).GitCommit=$(GIT_COMMIT) -X $(CMD_VERSION).BuildDate=$(BUILD_DATE) -X $(CMD_VERSION).Version=$(VERSION)" -o bin/linux/amd64/$(BIN) ./cmd/k8s-netperf
 
 container-build: build
 	@echo "Building the container image"
@@ -70,7 +75,7 @@ gha-push:
 	$(CONTAINER) manifest push $(CONTAINER_NS)/${BIN}:latest $(CONTAINER_NS)/${BIN}:latest
 
 clean:
-	rm -rf bin/$(ARCH)
+	rm -rf bin/$(ARCH) bin/linux/amd64
 
 verify: verify-fast
 

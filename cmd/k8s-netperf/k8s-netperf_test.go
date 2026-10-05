@@ -7,6 +7,156 @@ import (
 	"github.com/cloud-bulldozer/k8s-netperf/pkg/metrics"
 )
 
+func TestParseAnnotations(t *testing.T) {
+	testCases := []struct {
+		name    string
+		values  []string
+		want    map[string]string
+		wantErr bool
+	}{
+		{name: "multiple annotations", values: []string{"example.com/one=value", "example.com/two=value=with=equals"}, want: map[string]string{"example.com/one": "value", "example.com/two": "value=with=equals"}},
+		{name: "missing separator", values: []string{"example.com/key"}, wantErr: true},
+		{name: "empty key", values: []string{"=value"}, wantErr: true},
+		{name: "empty value", values: []string{"example.com/key="}, wantErr: true},
+		{name: "whitespace-only key", values: []string{"   =value"}, wantErr: true},
+		{name: "whitespace-only value", values: []string{"example.com/key=   "}, wantErr: true},
+		{name: "malformed key", values: []string{"not a key=value"}, wantErr: true},
+		{name: "duplicate key", values: []string{"example.com/key=one", "example.com/key=two"}, wantErr: true},
+		{name: "managed istio key", values: []string{"sidecar.istio.io/inject=false"}, wantErr: true},
+		{name: "managed network key", values: []string{"k8s.v1.cni.cncf.io/networks=netperf/network"}, wantErr: true},
+		{name: "managed generated network status key", values: []string{"k8s.v1.cni.cncf.io/network-status=netperf/network"}, wantErr: true},
+		{name: "managed ovn network key", values: []string{"k8s.ovn.org/pod-networks=netperf/network"}, wantErr: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseAnnotations(tc.values)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("parseAnnotations() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAnnotations() error = %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseAnnotations() = %#v, want %#v", got, tc.want)
+			}
+			for key, want := range tc.want {
+				if got[key] != want {
+					t.Errorf("parseAnnotations()[%q] = %q, want %q", key, got[key], want)
+				}
+			}
+		})
+	}
+}
+
+func TestParseLabels(t *testing.T) {
+	testCases := []struct {
+		name    string
+		values  []string
+		want    map[string]string
+		wantErr bool
+	}{
+		{name: "multiple labels", values: []string{"example.com/team=networking", "environment=test"}, want: map[string]string{"example.com/team": "networking", "environment": "test"}},
+		{name: "missing separator", values: []string{"example.com/team"}, wantErr: true},
+		{name: "empty key", values: []string{"=value"}, wantErr: true},
+		{name: "empty value", values: []string{"example.com/team="}, wantErr: true},
+		{name: "invalid key", values: []string{"not a key=value"}, wantErr: true},
+		{name: "invalid value", values: []string{"example.com/team=not a value"}, wantErr: true},
+		{name: "duplicate key", values: []string{"example.com/team=one", "example.com/team=two"}, wantErr: true},
+		{name: "managed role selector", values: []string{"role=server"}, wantErr: true},
+		{name: "managed app selector", values: []string{"app=server"}, wantErr: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseLabels(tc.values)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("parseLabels() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseLabels() error = %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseLabels() = %#v, want %#v", got, tc.want)
+			}
+			for key, want := range tc.want {
+				if got[key] != want {
+					t.Errorf("parseLabels()[%q] = %q, want %q", key, got[key], want)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateWorkloadOptions(t *testing.T) {
+	testCases := []struct {
+		name              string
+		runtimeClass      string
+		runtimeClassSet   bool
+		launchSecurity    string
+		launchSecuritySet bool
+		pod               bool
+		vm                bool
+		hostNetOnly       bool
+		wantErr           bool
+	}{
+		{name: "pod runtime class", runtimeClass: "kata", runtimeClassSet: true, pod: true},
+		{name: "empty runtime class", runtimeClassSet: true, pod: true, wantErr: true},
+		{name: "runtime class with pods disabled", runtimeClass: "kata", runtimeClassSet: true, vm: true, wantErr: true},
+		{name: "runtime class with host network only", runtimeClass: "kata", runtimeClassSet: true, pod: true, hostNetOnly: true, wantErr: true},
+		{name: "snp launch security", launchSecurity: "snp", launchSecuritySet: true, vm: true},
+		{name: "tdx launch security", launchSecurity: "tdx", launchSecuritySet: true, vm: true},
+		{name: "launch security without VM", launchSecurity: "snp", launchSecuritySet: true, pod: true, wantErr: true},
+		{name: "invalid launch security", launchSecurity: "sev", launchSecuritySet: true, vm: true, wantErr: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateWorkloadOptions(nil, tc.runtimeClass, tc.runtimeClassSet, tc.launchSecurity, tc.launchSecuritySet, tc.pod, tc.vm, tc.hostNetOnly)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateWorkloadOptions() error = %v, wantErr %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateAirGappedOptions(t *testing.T) {
+	tests := []struct {
+		name, image, vmImage, offline, wantNamespace, wantName string
+		imageSet, vmImageSet, vm                               bool
+		wantErr                                                bool
+	}{
+		{name: "image override is verbatim", image: "mirror.local/path/netperf:tag", imageSet: true, vm: true},
+		{name: "offline DataVolume", offline: "operator-images/prepared", vm: true, wantNamespace: "operator-images", wantName: "prepared"},
+		{name: "offline DataVolume requires VM", offline: "operator-images/prepared", wantErr: true},
+		{name: "offline DataVolume conflicts with explicit VM image", vmImage: "mirror.local/vm:tag", vmImageSet: true, offline: "operator-images/prepared", vm: true, wantErr: true},
+		{name: "malformed DataVolume", offline: "prepared", vm: true, wantErr: true},
+		{name: "DataVolume has empty namespace", offline: "/prepared", vm: true, wantErr: true},
+		{name: "DataVolume has empty name", offline: "operator-images/", vm: true, wantErr: true},
+		{name: "DataVolume has extra path separator", offline: "operator-images/prepared/extra", vm: true, wantErr: true},
+		{name: "benchmark namespace source allowed", offline: "netperf/prepared", vm: true, wantNamespace: "netperf", wantName: "prepared"},
+		{name: "empty explicit image", imageSet: true, vm: true, wantErr: true},
+		{name: "empty explicit VM image", vmImageSet: true, vm: true, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ns, name, err := validateAirGappedOptions(tc.image, tc.imageSet, tc.vmImage, tc.vmImageSet, tc.offline, tc.vm)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateAirGappedOptions() error = %v, wantErr %t", err, tc.wantErr)
+			}
+			if ns != tc.wantNamespace || name != tc.wantName {
+				t.Errorf("DataVolume = %s/%s, want %s/%s", ns, name, tc.wantNamespace, tc.wantName)
+			}
+		})
+	}
+}
+
 func TestApplyClusterDistributionSetsPrometheusFlags(t *testing.T) {
 	testCases := []struct {
 		name       string

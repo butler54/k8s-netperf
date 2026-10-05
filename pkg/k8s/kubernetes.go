@@ -14,10 +14,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/watch"
@@ -42,7 +44,10 @@ type DeploymentParams struct {
 	NodeAffinity       corev1.NodeAffinity
 	Port               int
 	NetworkAnnotations map[string]string
+	Annotations        map[string]string
+	WorkloadLabels     map[string]string
 	ResourceRequests   corev1.ResourceList
+	RuntimeClass       string
 }
 
 // ServiceParams describes the service specific details
@@ -110,6 +115,146 @@ const SriovPolicyName = "sriov-netperf-policy"
 const sriovOperatorNamespace = "openshift-sriov-network-operator"
 const MacvlanNadName = "macvlan-netperf"
 const netperfNamespaceLabel = "k8s-netperf"
+const deploymentReadyTimeout = 11 * time.Minute
+
+var dataVolumeGVR = schema.GroupVersionResource{Group: "cdi.kubevirt.io", Version: "v1beta1", Resource: "datavolumes"}
+
+var vmiGVR = schema.GroupVersionResource{Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances"}
+
+var routeGVR = schema.GroupVersionResource{Group: "route.openshift.io", Version: "v1", Resource: "routes"}
+
+const offlineCloneLabel = "k8s-netperf.io/offline-clone"
+const offlineCloneRunLabel = "k8s-netperf.io/run-uuid"
+const offlineCloneSourceAnnotation = "k8s-netperf.io/source-datavolume"
+const benchmarkManagedLabel = "k8s-netperf.io/managed"
+
+func benchmarkPodImage(s *config.PerfScenarios) string {
+	if s.PodImage != "" {
+		return s.PodImage
+	}
+	return k8sNetperfImage
+}
+
+// ValidateOfflineDataVolume verifies that an operator-managed CDI DataVolume is ready to clone.
+func ValidateOfflineDataVolume(ctx context.Context, dyn dynamic.Interface, sourceNamespace, sourceName string) error {
+	dv, err := dyn.Resource(dataVolumeGVR).Namespace(sourceNamespace).Get(ctx, sourceName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("offline source DataVolume %s/%s was not found", sourceNamespace, sourceName)
+		}
+		return fmt.Errorf("get offline source DataVolume %s/%s: %w", sourceNamespace, sourceName, err)
+	}
+	phase, _, _ := unstructured.NestedString(dv.Object, "status", "phase")
+	if phase != "Succeeded" {
+		return fmt.Errorf("offline source DataVolume %s/%s is not ready (phase %q, want %q)", sourceNamespace, sourceName, phase, "Succeeded")
+	}
+	return nil
+}
+
+// CreateOfflineDataVolumeClone creates the benchmark-owned clone used as one VMI disk.
+func CreateOfflineDataVolumeClone(ctx context.Context, dyn dynamic.Interface, sourceNamespace, sourceName, cloneName, runUUID string) error {
+	if err := ValidateOfflineDataVolume(ctx, dyn, sourceNamespace, sourceName); err != nil {
+		return err
+	}
+	source, err := dyn.Resource(dataVolumeGVR).Namespace(sourceNamespace).Get(ctx, sourceName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get offline source DataVolume %s/%s: %w", sourceNamespace, sourceName, err)
+	}
+	storage, storageFound, err := unstructured.NestedMap(source.Object, "spec", "storage")
+	if err != nil {
+		return fmt.Errorf("read offline source DataVolume storage: %w", err)
+	}
+	pvc, pvcFound, err := unstructured.NestedMap(source.Object, "spec", "pvc")
+	if err != nil {
+		return fmt.Errorf("read offline source DataVolume PVC: %w", err)
+	}
+	if !storageFound && !pvcFound {
+		return fmt.Errorf("offline source DataVolume %s/%s has neither spec.storage nor spec.pvc", sourceNamespace, sourceName)
+	}
+	volumeSpec := storage
+	if !storageFound {
+		volumeSpec = pvc
+	}
+	requests, found, err := unstructured.NestedString(volumeSpec, "resources", "requests", "storage")
+	if err != nil || !found || requests == "" {
+		return fmt.Errorf("offline source DataVolume %s/%s has no requested storage", sourceNamespace, sourceName)
+	}
+	clones := dyn.Resource(dataVolumeGVR).Namespace(namespace)
+	if existing, err := clones.Get(ctx, cloneName, metav1.GetOptions{}); err == nil {
+		if err := validateOfflineClone(existing, sourceNamespace, sourceName, runUUID); err != nil {
+			return fmt.Errorf("offline clone DataVolume %s/%s cannot be reused: %w", namespace, cloneName, err)
+		}
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get offline clone DataVolume %s/%s: %w", namespace, cloneName, err)
+	}
+	clone := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "cdi.kubevirt.io/v1beta1",
+		"kind":       "DataVolume",
+		"metadata": map[string]interface{}{
+			"name":      cloneName,
+			"namespace": namespace,
+			"labels":    map[string]interface{}{offlineCloneLabel: "true"},
+			"annotations": map[string]interface{}{
+				offlineCloneSourceAnnotation: sourceNamespace + "/" + sourceName,
+			},
+		},
+		"spec": map[string]interface{}{
+			"source": map[string]interface{}{"pvc": map[string]interface{}{"namespace": sourceNamespace, "name": sourceName}},
+		},
+	}}
+	labels := clone.Object["metadata"].(map[string]interface{})["labels"].(map[string]interface{})
+	labels[offlineCloneRunLabel] = runUUID
+	if storageFound {
+		clone.Object["spec"].(map[string]interface{})["storage"] = runtime.DeepCopyJSONValue(storage)
+	} else {
+		clone.Object["spec"].(map[string]interface{})["pvc"] = runtime.DeepCopyJSONValue(pvc)
+	}
+	if _, err := clones.Create(ctx, clone, metav1.CreateOptions{}); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			existing, getErr := clones.Get(ctx, cloneName, metav1.GetOptions{})
+			if getErr == nil {
+				if validateErr := validateOfflineClone(existing, sourceNamespace, sourceName, runUUID); validateErr == nil {
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("create offline clone DataVolume %s/%s: %w", namespace, cloneName, err)
+	}
+	return nil
+}
+
+func validateOfflineClone(clone *unstructured.Unstructured, sourceNamespace, sourceName, runUUID string) error {
+	labels := clone.GetLabels()
+	if labels[offlineCloneLabel] != "true" {
+		return fmt.Errorf("it is not managed by k8s-netperf")
+	}
+	annotations := clone.GetAnnotations()
+	if annotations[offlineCloneSourceAnnotation] != sourceNamespace+"/"+sourceName {
+		return fmt.Errorf("it belongs to source %q, not %q", annotations[offlineCloneSourceAnnotation], sourceNamespace+"/"+sourceName)
+	}
+	if labels[offlineCloneRunLabel] != runUUID {
+		return fmt.Errorf("it belongs to run %q, not %q", labels[offlineCloneRunLabel], runUUID)
+	}
+	return nil
+}
+
+func offlineCloneName(vmName, runUUID string) string {
+	runID := strings.ToLower(runUUID)
+	runID = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, runID)
+	if len(runID) > 12 {
+		runID = runID[:12]
+	}
+	if runID == "" {
+		runID = "unknown"
+	}
+	return fmt.Sprintf("%s-disk-%s", vmName, runID)
+}
 
 // ValidateBridgeNetwork validates that the specified bridge namespace and NetworkAttachmentDefinition exist
 func ValidateBridgeNetwork(client *kubernetes.Clientset, dyn dynamic.Interface, bridgeNetwork, bridgeNamespace string) error {
@@ -657,6 +802,7 @@ func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
 	var netperfDataPorts []int32
 	var netperfVmDataPorts []int32
 	var err error
+	podImage := benchmarkPodImage(s)
 
 	// Build SR-IOV resource requests if needed
 	var sriovResources corev1.ResourceList
@@ -695,13 +841,18 @@ func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
 			Name:               "client",
 			Namespace:          "netperf",
 			Replicas:           1,
-			Image:              k8sNetperfImage,
+			Image:              podImage,
 			Labels:             map[string]string{"role": clientRole},
 			Commands:           [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
 			Port:               NetperfServerCtlPort,
 			NetworkAnnotations: networkAnnotations,
 			ResourceRequests:   sriovResources,
 			Privileged:         s.Privileged,
+			Annotations:        s.Annotations,
+			WorkloadLabels:     s.Labels,
+		}
+		if !cdp.HostNetwork {
+			cdp.RuntimeClass = s.RuntimeClass
 		}
 
 		cdp.NodeAffinity = corev1.NodeAffinity{
@@ -785,13 +936,18 @@ func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
 			Namespace:          "netperf",
 			Replicas:           1,
 			HostNetwork:        s.HostNetwork,
-			Image:              k8sNetperfImage,
+			Image:              podImage,
 			Labels:             map[string]string{"role": clientRole},
 			Commands:           [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
 			Port:               NetperfServerCtlPort,
 			NetworkAnnotations: networkAnnotations,
 			ResourceRequests:   sriovResources,
 			Privileged:         s.Privileged,
+			Annotations:        s.Annotations,
+			WorkloadLabels:     s.Labels,
+		}
+		if !cdp.HostNetwork {
+			cdp.RuntimeClass = s.RuntimeClass
 		}
 		if z != "" && numNodes > 1 {
 			cdp.NodeAffinity = corev1.NodeAffinity{
@@ -965,28 +1121,33 @@ func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
 		Name:               "client-across",
 		Namespace:          "netperf",
 		Replicas:           1,
-		Image:              k8sNetperfImage,
+		Image:              podImage,
 		Labels:             map[string]string{"role": clientAcrossRole},
 		Commands:           [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
 		Port:               NetperfServerCtlPort,
 		NetworkAnnotations: networkAnnotations,
 		ResourceRequests:   sriovResources,
 		Privileged:         s.Privileged,
+		Annotations:        s.Annotations,
+		WorkloadLabels:     s.Labels,
+		RuntimeClass:       s.RuntimeClass,
 	}
 	cdpAcross.PodAntiAffinity = corev1.PodAntiAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: clientRoleAffinity,
 	}
 
 	cdpHostAcross := DeploymentParams{
-		Name:        "client-host",
-		Namespace:   "netperf",
-		Replicas:    1,
-		HostNetwork: true,
-		Image:       k8sNetperfImage,
-		Labels:      map[string]string{"role": hostNetClientRole},
-		Commands:    [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
-		Port:        NetperfServerCtlPort,
-		Privileged:  s.Privileged,
+		Name:           "client-host",
+		Namespace:      "netperf",
+		Replicas:       1,
+		HostNetwork:    true,
+		Image:          podImage,
+		Labels:         map[string]string{"role": hostNetClientRole},
+		Commands:       [][]string{{"/bin/bash", "-c", "sleep 10000000"}},
+		Port:           NetperfServerCtlPort,
+		Privileged:     s.Privileged,
+		Annotations:    s.Annotations,
+		WorkloadLabels: s.Labels,
 	}
 	if z != "" {
 		if numNodes > 1 {
@@ -1118,28 +1279,32 @@ func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
 	}
 
 	sdpHost := DeploymentParams{
-		Name:        "server-host",
-		Namespace:   "netperf",
-		Replicas:    1,
-		HostNetwork: true,
-		Image:       k8sNetperfImage,
-		Labels:      map[string]string{"role": hostNetServerRole},
-		Commands:    dpCommands,
-		Port:        NetperfServerCtlPort,
-		Privileged:  s.Privileged,
+		Name:           "server-host",
+		Namespace:      "netperf",
+		Replicas:       1,
+		HostNetwork:    true,
+		Image:          podImage,
+		Labels:         map[string]string{"role": hostNetServerRole},
+		Commands:       dpCommands,
+		Port:           NetperfServerCtlPort,
+		Privileged:     s.Privileged,
+		Annotations:    s.Annotations,
+		WorkloadLabels: s.Labels,
 	}
 	// Start netperf server
 	sdp := DeploymentParams{
 		Name:               "server",
 		Namespace:          "netperf",
 		Replicas:           1,
-		Image:              k8sNetperfImage,
+		Image:              podImage,
 		Labels:             map[string]string{"role": serverRole},
 		Commands:           dpCommands,
 		Port:               NetperfServerCtlPort,
 		NetworkAnnotations: networkAnnotations,
 		ResourceRequests:   sriovResources,
 		Privileged:         s.Privileged,
+		Annotations:        s.Annotations,
+		WorkloadLabels:     s.Labels,
 	}
 	if s.NodeLocal {
 		sdp.PodAffinity = corev1.PodAffinity{
@@ -1149,6 +1314,9 @@ func BuildSUT(client *kubernetes.Clientset, s *config.PerfScenarios) error {
 		if s.HostNetwork {
 			sdp.HostNetwork = true
 		}
+	}
+	if !sdp.HostNetwork {
+		sdp.RuntimeClass = s.RuntimeClass
 	}
 	if z != "" {
 		var affinity corev1.NodeAffinity
@@ -1366,9 +1534,16 @@ func ExtractUdnIp(pod corev1.Pod, networkName string) (string, error) {
 
 // launchServerVM will create the ServerVM with the specific node and pod affinity.
 func launchServerVM(perf *config.PerfScenarios, name string, podAff *corev1.PodAntiAffinity, nodeAff *corev1.NodeAffinity) error {
-	_, err := CreateVMServer(perf.KClient, name, name, *podAff, *nodeAff, perf.VMImage, perf.BridgeServerNetwork, perf.Udn, perf.UdnPluginBinding, perf.Cudn,
+	diskDataVolume := ""
+	if perf.OfflineDataVolume != "" {
+		diskDataVolume = offlineCloneName(name, perf.RunUUID)
+		if err := CreateOfflineDataVolumeClone(context.Background(), perf.DClient, perf.OfflineDataVolumeNS, perf.OfflineDataVolume, diskDataVolume, perf.RunUUID); err != nil {
+			return err
+		}
+	}
+	_, err := CreateVMServer(perf.KClient, name, name, *podAff, *nodeAff, perf.VMImage, diskDataVolume, perf.BridgeServerNetwork, perf.Udn, perf.UdnPluginBinding, perf.Cudn,
 		perf.LocalnetNetwork != "", perf.LocalnetServerNetwork,
-		perf.SriovNetwork, perf.Sockets, perf.Cores, perf.Threads)
+		perf.SriovNetwork, perf.Sockets, perf.Cores, perf.Threads, perf.Annotations, perf.Labels, perf.LaunchSecurity, perf.RequestedDrivers, perf.Configs)
 	if err != nil {
 		return err
 	}
@@ -1395,9 +1570,16 @@ func launchServerVM(perf *config.PerfScenarios, name string, podAff *corev1.PodA
 
 // launchClientVM will create the ClientVM with the specific node and pod affinity.
 func launchClientVM(perf *config.PerfScenarios, name string, podAff *corev1.PodAntiAffinity, nodeAff *corev1.NodeAffinity) error {
-	host, err := CreateVMClient(perf.KClient, perf.ClientSet, perf.DClient, name, podAff, nodeAff, perf.VMImage, perf.BridgeClientNetwork, perf.Udn, perf.UdnPluginBinding, perf.Cudn,
+	diskDataVolume := ""
+	if perf.OfflineDataVolume != "" {
+		diskDataVolume = offlineCloneName(name, perf.RunUUID)
+		if err := CreateOfflineDataVolumeClone(context.Background(), perf.DClient, perf.OfflineDataVolumeNS, perf.OfflineDataVolume, diskDataVolume, perf.RunUUID); err != nil {
+			return err
+		}
+	}
+	host, err := CreateVMClient(perf.KClient, perf.ClientSet, perf.DClient, name, podAff, nodeAff, perf.VMImage, diskDataVolume, perf.BridgeClientNetwork, perf.Udn, perf.UdnPluginBinding, perf.Cudn,
 		perf.LocalnetNetwork != "", perf.LocalnetClientNetwork,
-		perf.SriovNetwork, perf.Sockets, perf.Cores, perf.Threads)
+		perf.SriovNetwork, perf.Sockets, perf.Cores, perf.Threads, perf.Annotations, perf.Labels, perf.LaunchSecurity, perf.RequestedDrivers, perf.Configs)
 	if err != nil {
 		return err
 	}
@@ -1469,27 +1651,81 @@ func deployDeployment(client *kubernetes.Clientset, dp DeploymentParams) (corev1
 	return pods, nil
 }
 
-// WaitForReady accepts the client and deployment params to determine which pods to watch.
-// It will return a bool based on if the pods ever become ready before we move on.
-func WaitForReady(c *kubernetes.Clientset, dp DeploymentParams) (bool, error) {
+// WaitForReady waits for a Deployment to have a ready replica or report a failure.
+func WaitForReady(c kubernetes.Interface, dp DeploymentParams) (bool, error) {
 	log.Infof("⏰ Checking for %s Pods to become ready...", dp.Name)
-	dw, err := c.AppsV1().Deployments(dp.Namespace).Watch(context.TODO(), metav1.ListOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), deploymentReadyTimeout)
+	defer cancel()
+
+	deployments := c.AppsV1().Deployments(dp.Namespace)
+	deployment, err := deployments.Get(ctx, dp.Name, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	if err := deploymentFailureError(deployment, dp); err != nil {
+		return false, err
+	}
+	if deployment.Status.ReadyReplicas == 1 {
+		return true, nil
+	}
+
+	dw, err := deployments.Watch(ctx, metav1.ListOptions{
+		FieldSelector:   "metadata.name=" + dp.Name,
+		ResourceVersion: deployment.ResourceVersion,
+	})
 	if err != nil {
 		return false, err
 	}
 	defer dw.Stop()
-	for event := range dw.ResultChan() {
-		d, ok := event.Object.(*appsv1.Deployment)
-		if !ok {
-			log.Error("❌ Issue with the Deployment")
-		}
-		if d.Name == dp.Name {
+	for {
+		select {
+		case <-ctx.Done():
+			return false, deploymentReadyTimeoutError(dp)
+		case event, ok := <-dw.ResultChan():
+			if !ok {
+				return false, fmt.Errorf("deployment watch closed before deployment %q became ready", dp.Name)
+			}
+			if event.Type == watch.Error {
+				return false, fmt.Errorf("watching deployment %q: %w", dp.Name, apierrors.FromObject(event.Object))
+			}
+			if event.Type == watch.Deleted {
+				return false, fmt.Errorf("deployment %q in namespace %q was deleted before becoming ready", dp.Name, dp.Namespace)
+			}
+			d, ok := event.Object.(*appsv1.Deployment)
+			if !ok {
+				log.Error("❌ Issue with the Deployment")
+				continue
+			}
+			if d.Name != dp.Name {
+				continue
+			}
+			if err := deploymentFailureError(d, dp); err != nil {
+				return false, err
+			}
 			if d.Status.ReadyReplicas == 1 {
 				return true, nil
 			}
 		}
 	}
-	return false, fmt.Errorf("❌ Deployment had issues")
+}
+
+func deploymentReadyTimeoutError(dp DeploymentParams) error {
+	return fmt.Errorf("timed out waiting %s for deployment %q in namespace %q to become ready with image %q; inspect pod events for image pull failures", deploymentReadyTimeout, dp.Name, dp.Namespace, dp.Image)
+}
+
+func deploymentFailureError(d *appsv1.Deployment, dp DeploymentParams) error {
+	for _, condition := range d.Status.Conditions {
+		switch {
+		case condition.Type == appsv1.DeploymentReplicaFailure && condition.Status == corev1.ConditionTrue:
+			if dp.RuntimeClass != "" && strings.Contains(strings.ToLower(condition.Message), "runtimeclass") {
+				return fmt.Errorf("deployment %q failed to create pod workload with runtime class %q (%s): %s", d.Name, dp.RuntimeClass, condition.Reason, condition.Message)
+			}
+			return fmt.Errorf("deployment %q failed to create pods (%s): %s", d.Name, condition.Reason, condition.Message)
+		case condition.Type == appsv1.DeploymentProgressing && condition.Status == corev1.ConditionFalse:
+			return fmt.Errorf("deployment %q did not become ready (%s): %s; workload may be unschedulable", d.Name, condition.Reason, condition.Message)
+		}
+	}
+	return nil
 }
 
 func areNodesLabeled(c *kubernetes.Clientset) bool {
@@ -1564,7 +1800,10 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 	}
 	log.Infof("🚀 Starting Deployment for: %s in namespace: %s", dp.Name, dp.Namespace)
 	dc := client.AppsV1().Deployments(dp.Namespace)
+	return dc.Create(context.TODO(), newDeployment(dp), metav1.CreateOptions{})
+}
 
+func newDeployment(dp DeploymentParams) *appsv1.Deployment {
 	// Add containers to deployment
 	var cmdContainers []corev1.Container
 	for i := 0; i < len(dp.Commands); i++ {
@@ -1595,17 +1834,20 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 		cmdContainers = append(cmdContainers, container)
 	}
 
-	// Merge network annotations with default annotations
-	annotations := map[string]string{
-		"sidecar.istio.io/inject": "true",
+	// Apply tool-managed annotations last so callers cannot override required behavior.
+	annotations := make(map[string]string, len(dp.Annotations)+len(dp.NetworkAnnotations)+1)
+	for k, v := range dp.Annotations {
+		annotations[k] = v
 	}
+	annotations["sidecar.istio.io/inject"] = "true"
 	for k, v := range dp.NetworkAnnotations {
 		annotations[k] = v
 	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: dp.Name,
+			Name:   dp.Name,
+			Labels: benchmarkResourceLabels(dp.Labels),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &dp.Replicas,
@@ -1614,13 +1856,14 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels:      dp.Labels,
+					Labels:      mergeLabels(dp.Labels, dp.WorkloadLabels),
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: ptr.To(int64(1)),
 					ServiceAccountName:            sa,
 					HostNetwork:                   dp.HostNetwork,
+					RuntimeClassName:              deploymentRuntimeClassName(dp),
 					Containers:                    cmdContainers,
 					Affinity: &corev1.Affinity{
 						NodeAffinity:    &dp.NodeAffinity,
@@ -1631,7 +1874,46 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 			},
 		},
 	}
-	return dc.Create(context.TODO(), deployment, metav1.CreateOptions{})
+	return deployment
+}
+
+// mergeLabels returns a copy of custom labels with managed labels applied last.
+// This keeps selectors stable even if a caller bypasses CLI validation.
+func mergeLabels(managed, custom map[string]string) map[string]string {
+	labels := make(map[string]string, len(managed)+len(custom))
+	for key, value := range custom {
+		labels[key] = value
+	}
+	for key, value := range managed {
+		labels[key] = value
+	}
+	return labels
+}
+
+func benchmarkResourceLabels(labels map[string]string) map[string]string {
+	resourceLabels := make(map[string]string, len(labels)+1)
+	for key, value := range labels {
+		resourceLabels[key] = value
+	}
+	resourceLabels[benchmarkManagedLabel] = "true"
+	return resourceLabels
+}
+
+func runtimeClassName(name string) *string {
+	if name == "" {
+		return nil
+	}
+	return &name
+}
+
+// deploymentRuntimeClassName applies runtime classes only to pod-network workloads.
+// BuildSUT keeps host-network DeploymentParams free of a runtime class; this guard also
+// protects callers that construct DeploymentParams directly.
+func deploymentRuntimeClassName(dp DeploymentParams) *string {
+	if dp.HostNetwork {
+		return nil
+	}
+	return runtimeClassName(dp.RuntimeClass)
 }
 
 // GetPodNodeInfo collects the node information for a node running a pod with a specific label
@@ -1685,6 +1967,7 @@ func CreateService(sp ServiceParams, client *kubernetes.Clientset) (*corev1.Serv
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sp.Name,
 			Namespace: sp.Namespace,
+			Labels:    benchmarkResourceLabels(sp.Labels),
 		},
 		Spec: corev1.ServiceSpec{
 			Ports: []corev1.ServicePort{
@@ -1760,6 +2043,29 @@ func DestroyNamespace(client *kubernetes.Clientset) error {
 			return err
 		}
 		return waitForNamespaceDelete(client, namespace)
+	}
+	return nil
+}
+
+// DestroyBenchmarkResources removes resources created for a benchmark without
+// deleting the namespace. This preserves an offline source DataVolume when an
+// operator stores it in the benchmark namespace.
+func DestroyBenchmarkResources(client kubernetes.Interface, dyn dynamic.Interface) error {
+	selector := benchmarkManagedLabel + "=true"
+	if err := client.AppsV1().Deployments(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
+		return fmt.Errorf("delete benchmark deployments: %w", err)
+	}
+	if err := client.CoreV1().Services(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
+		return fmt.Errorf("delete benchmark services: %w", err)
+	}
+	if err := dyn.Resource(vmiGVR).Namespace(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
+		return fmt.Errorf("delete benchmark VMIs: %w", err)
+	}
+	if err := dyn.Resource(routeGVR).Namespace(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
+		return fmt.Errorf("delete benchmark routes: %w", err)
+	}
+	if err := dyn.Resource(dataVolumeGVR).Namespace(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: offlineCloneLabel + "=true"}); err != nil {
+		return fmt.Errorf("delete benchmark offline clone DataVolumes: %w", err)
 	}
 	return nil
 }

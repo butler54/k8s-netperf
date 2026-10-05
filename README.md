@@ -54,6 +54,7 @@ For detailed documentation, please refer to the following guides:
 - **[Setup and Installation](docs/setup.md)** - How to build, install, and configure k8s-netperf
 - **[Configuration](docs/configuration.md)** - Configuration file formats, benchmark options, and OpenSearch integration
 - **[Advanced Usage](docs/advanced-usage.md)** - VMs, User Defined Networks (UDN), bridge networks, SR-IOV, MACVLAN and external servers
+- **[Air-gapped operation](docs/advanced-usage.md#offline-vm-datavolumes)** - Mirrored images and offline VM DataVolume preparation
 - **[Output and Results](docs/output-and-results.md)** - Understanding test output, pass/fail criteria, and CSV exports
 
 ## Features
@@ -69,3 +70,5 @@ For detailed documentation, please refer to the following guides:
 ## Contributing
 
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to this project.
+
+Test edit.

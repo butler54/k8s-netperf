@@ -24,6 +24,67 @@ If the two above are in place, users can orhestrate k8s-netperf to launch VMs by
 k8s-netperf --vm
 ```
 
+### Offline VM DataVolumes
+
+For fully disconnected VM benchmarks, use a bootable Fedora-compatible VM disk in any namespace. The
+disk must already include SSH access for `fedora`,
+`netperf`/`netserver`, `iperf3`, `uperf`, and their runtime libraries. Build or import the disk using
+your approved connected build environment, then deliver it in-cluster as a CDI DataVolume. Do not
+expect the benchmark to install packages, clone source, or download build artifacts at boot.
+
+Confirm the source is ready before running:
+
+```shell
+$ kubectl get datavolume -n operator-images prepared-netperf
+NAME               PHASE
+prepared-netperf   Succeeded
+$ k8s-netperf --vm --pod=false --offline-data-volume=operator-images/prepared-netperf
+```
+
+The source DataVolume must have phase `Succeeded`. k8s-netperf verifies it before creating VMIs,
+creates one labeled clone DataVolume per client/server VMI in `netperf`, and attaches each clone as
+that VMI's `disk0`. Offline cloud-init only configures guest access/networking, verifies the local
+tools, and starts local server processes; it contains no `dnf`, `git`, `curl`, package download, or
+source-build fallback. Before running workloads, k8s-netperf also checks the selected client tools and
+reports a missing prerequisite rather than triggering an internet download. When the source is outside
+`netperf`, cleanup removes the benchmark namespace and its clone volumes. When the source is in
+`netperf`, cleanup preserves the source and removes only benchmark-owned clone volumes.
+
+For the standard KubeVirt masquerade pod network, k8s-netperf omits cloud-init network data entirely.
+The prepared Fedora image must retain DHCP configuration for its primary guest interface. Explicit
+cloud-init network data is used only for secondary or static network configurations.
+
+`--offline-data-volume` is VM-only, uses `NAMESPACE/NAME`, and cannot be combined with an explicitly
+specified `--vm-image` because the clone replaces the container disk.
+
+### Workload isolation options
+
+Use `--annotation KEY=VALUE` repeatedly to add the same annotations to every benchmark pod template or VMI. k8s-netperf rejects empty, malformed, duplicate, and tool-managed annotation keys so it can preserve its Istio and network configuration.
+
+Use `--label KEY=VALUE` repeatedly to add labels to every benchmark pod template or VMI. Label keys and values must be valid Kubernetes labels. Empty, malformed, or duplicate labels are rejected before resources are created. The `app` and `role` labels are managed by k8s-netperf for workload and service selection, so they cannot be supplied with `--label`.
+
+```bash
+k8s-netperf --label example.com/team=networking --label environment=staging
+```
+
+For pod benchmarks, `--runtime-class NAME` sets the pod `runtimeClassName`, for example:
+
+```bash
+k8s-netperf --runtime-class kata --annotation example.com/isolation=enabled
+```
+
+`--runtime-class` is pod-only and cannot be used with `--pod=false` or `--hostNet`.
+When running all scenarios with `--all`, k8s-netperf applies the runtime class only to
+pod-network workloads; host-network workloads use the cluster's default runtime.
+
+For VM benchmarks, KubeVirt 1.8.4 or newer is required. Use `--launch-security snp` or `--launch-security tdx` with `--vm` to request the corresponding confidential-VM launch security:
+
+```bash
+k8s-netperf --vm --pod=false --launch-security tdx
+```
+
+Launch security is VM-only. SNP and TDX VMIs explicitly enable ACPI, use a host-passthrough CPU, the `q35` machine type, and UEFI with Secure Boot disabled. The selected `launchSecurity` member is the only difference. k8s-netperf does not configure TDX attestation. Cluster admission errors are returned to the operator. Ensure that the selected feature gate, scheduling, and hardware capability are available before running the benchmark.
+
 ## Using User Defined Network - UDN (only on OCP 4.18 and above)
 To run k8s-netperf using a UDN primary network for the test instead of the default network of OVN-k:
 

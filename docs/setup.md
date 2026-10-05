@@ -8,6 +8,20 @@ $ cd k8s-netperf
 $ make build
 ```
 
+### Build for Linux AMD64 from macOS ARM64
+
+Build a deployable Linux x86_64 binary without changing the native build output:
+
+```shell
+$ make build-linux-amd64
+$ file bin/linux/amd64/k8s-netperf
+# ... ELF 64-bit ... x86-64 ... GNU/Linux ...
+```
+
+Copy `bin/linux/amd64/k8s-netperf` to the Linux AMD64 benchmark host and verify it with
+`k8s-netperf --help` (or `--version`). `make build` continues to produce the native-host binary at
+`bin/<host-architecture>/k8s-netperf`.
+
 ## Build Container Image
 
 ```shell
@@ -109,6 +123,9 @@ Flags:
       --csv                       Archive results, cluster and benchmark metrics in CSV files (default true)
       --serverIP string           External Server IP Address
       --privileged                Run pods with privileged security context
+      --annotation stringArray    Add KEY=VALUE annotation to benchmark pods and VMIs (repeatable)
+      --runtime-class string       RuntimeClass for benchmark pods
+      --launch-security string     VM launch security mode: snp or tdx
   -h, --help                      help for k8s-netperf
 ```
 
@@ -124,5 +141,27 @@ Flags:
 - `--iperf` will enable the iperf3 load driver for any stream test (TCP_STREAM, UDP_STREAM). iperf3 doesn't have a RR or CRR test-type.
 - `--uperf` will enable the uperf load driver for any stream test (TCP_STREAM, UDP_STREAM). uperf doesn't have CRR test-type.
 - `--ib-write-bw $NIC:$GID` will enable the ib-write-bw load driver for any stream UDP_STREAM tests. ib_write_bw doesn't have CRR test-type.
+- `--annotation KEY=VALUE` adds metadata to every benchmark pod template and VMI. Repeat the option for multiple annotations; values may contain `=`. Empty, malformed, duplicate, and k8s-netperf-managed keys are rejected.
+- `--runtime-class NAME` sets `spec.runtimeClassName` on benchmark pods. It requires pod execution and is rejected with `--pod=false`.
+- `--launch-security snp|tdx` sets the selected launch-security mode on benchmark VMIs. It requires `--vm`; it is rejected for pod-only runs.
+- `--image IMAGE` uses the complete pod image reference verbatim for every benchmark pod. Use this
+  for mirrors whose repository paths differ from upstream.
+- `--vm-image IMAGE` uses the complete container-disk image reference verbatim for online VM runs.
+- `--offline-data-volume NAMESPACE/NAME` uses a ready source DataVolume for VM benchmarks. It may be in
+  any namespace, cannot be combined with an explicitly selected `--vm-image`, and is preserved during
+  cleanup while only benchmark-owned clones are removed.
+
+## Air-gapped registry mirrors
+
+Mirror the required benchmark pod image and, for online VM runs, the VM container-disk image. Supply
+the complete final image references; k8s-netperf does not rewrite paths or fall back to public
+registries:
+
+```shell
+$ k8s-netperf --image mirror.example.local/bench/netperf:v1
+$ k8s-netperf --vm --pod=false --vm-image mirror.example.local/vm/fedora-netperf:v1
+```
+
+If an image cannot be pulled, Kubernetes reports the exact supplied reference in the workload event.
 
 > *Note: With OpenShift, we attempt to discover the OpenShift route. If that route is not reachable, it might be required to `port-forward` the service and pass that via the `--prom` option.*

@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -55,6 +56,8 @@ var (
 	pod               bool
 	vm                bool
 	vmimage           string
+	image             string
+	offlineDataVolume string
 	useVirtctl        bool
 	debug             bool
 	bridge            string
@@ -79,6 +82,10 @@ var (
 	cores             uint32
 	threads           uint32
 	privileged        bool
+	annotations       []string
+	workloadLabels    []string
+	runtimeClass      string
+	launchSecurity    string
 )
 
 var rootCmd = &cobra.Command{
@@ -102,6 +109,18 @@ var rootCmd = &cobra.Command{
 		ibWriteBwEnabled := cmd.Flags().Changed("ib-write-bw")
 		if ibWriteBwEnabled && strings.TrimSpace(ibWriteBw) == "" {
 			log.Fatalf("😭 --ib-write-bw requires nic:gid parameter (e.g., --ib-write-bw=mlx5_0:0)")
+		}
+		workloadAnnotations, err := validateWorkloadOptions(annotations, runtimeClass, cmd.Flags().Changed("runtime-class"), launchSecurity, cmd.Flags().Changed("launch-security"), pod, vm, hostNetOnly)
+		if err != nil {
+			log.Fatal(err)
+		}
+		labels, err := parseLabels(workloadLabels)
+		if err != nil {
+			log.Fatal(err)
+		}
+		offlineDataVolumeNS, offlineDataVolumeName, err := validateAirGappedOptions(image, cmd.Flags().Changed("image"), vmimage, cmd.Flags().Changed("vm-image"), offlineDataVolume, vm)
+		if err != nil {
+			log.Fatal(err)
 		}
 
 		if !uperf && !netperf && !iperf3 && !ibWriteBwEnabled {
@@ -255,30 +274,48 @@ var rootCmd = &cobra.Command{
 			log.Warnf("Cluster metadata client unavailable: %v", err)
 		}
 		if clean {
-			cleanup(client, rconfig)
+			cleanup(client, rconfig, offlineDataVolumeNS == "netperf")
 		}
 		s := config.PerfScenarios{
-			HostNetwork:     full || hostNetOnly,
-			HostNetworkOnly: hostNetOnly,
-			NodeLocal:       nl,
-			AcrossAZ:        acrossAZ,
-			RestConfig:      *rconfig,
-			Configs:         cfg,
-			ClientSet:       client,
-			BridgeNetwork:   bridge,
-			BridgeNamespace: bridgeNamespace,
-			SriovNetwork:    sriov,
-			MacvlanNetwork:  macvlan,
-			LocalnetNetwork: localnet,
-			Cudn:            cudn != "",
-			IbWriteBwParams: ibWriteBw,
-			Sockets:         sockets,
-			Cores:           cores,
-			Threads:         threads,
-			Privileged:      privileged,
+			HostNetwork:         full || hostNetOnly,
+			HostNetworkOnly:     hostNetOnly,
+			NodeLocal:           nl,
+			AcrossAZ:            acrossAZ,
+			RestConfig:          *rconfig,
+			Configs:             cfg,
+			ClientSet:           client,
+			BridgeNetwork:       bridge,
+			BridgeNamespace:     bridgeNamespace,
+			SriovNetwork:        sriov,
+			MacvlanNetwork:      macvlan,
+			LocalnetNetwork:     localnet,
+			Cudn:                cudn != "",
+			IbWriteBwParams:     ibWriteBw,
+			Sockets:             sockets,
+			Cores:               cores,
+			Threads:             threads,
+			Privileged:          privileged,
+			Annotations:         workloadAnnotations,
+			Labels:              labels,
+			RuntimeClass:        runtimeClass,
+			LaunchSecurity:      launchSecurity,
+			PodImage:            image,
+			OfflineDataVolume:   offlineDataVolumeName,
+			OfflineDataVolumeNS: offlineDataVolumeNS,
+			RunUUID:             uid,
 		}
 		if serverIPAddr != "" {
 			s.ExternalServer = true
+		}
+		if s.OfflineDataVolume != "" {
+			dynClient, err := dynamic.NewForConfig(rconfig)
+			if err != nil {
+				log.Fatal(err)
+			}
+			s.DClient = dynClient
+			if err := k8s.ValidateOfflineDataVolume(context.Background(), s.DClient, s.OfflineDataVolumeNS, s.OfflineDataVolume); err != nil {
+				log.Fatal(err)
+			}
 		}
 		// Get node count
 		nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker="})
@@ -396,7 +433,6 @@ var rootCmd = &cobra.Command{
 				s.UdnPluginBinding = udnPluginBinding
 			}
 		}
-
 		// Validate bridge network configuration before creating pods
 		if bridge != "" && !vm {
 			// Create dynamic client for validation if not already created
@@ -542,6 +578,15 @@ var rootCmd = &cobra.Command{
 				log.Fatal(err)
 			}
 			s.VMClientExecutor = vmClient
+			if s.OfflineDataVolume != "" {
+				if err := k8s.ValidateOfflineVMPrerequisites(vmClient, s.RequestedDrivers, s.Configs); err != nil {
+					log.Fatal(err)
+				}
+				vmServer := k8s.NewVirtctlClient("vm-server", "netperf")
+				if err := k8s.ValidateOfflineVMServerPrerequisites(vmServer, s.RequestedDrivers, s.Configs); err != nil {
+					log.Fatal(err)
+				}
+			}
 
 			for _, nc := range s.Configs {
 				// Determine the metric for the test
@@ -671,7 +716,7 @@ var rootCmd = &cobra.Command{
 			}
 		}
 		if clean {
-			cleanup(client, rconfig)
+			cleanup(client, rconfig, s.OfflineDataVolumeNS == "netperf")
 		}
 		// Cleanup extracted virtctl binary if any
 		if err := virtctl.CleanupExtractedBinary(); err != nil {
@@ -679,6 +724,115 @@ var rootCmd = &cobra.Command{
 		}
 		os.Exit(retCode)
 	},
+}
+
+var managedAnnotationKeys = map[string]struct{}{
+	"sidecar.istio.io/inject":           {},
+	"k8s.v1.cni.cncf.io/networks":       {},
+	"k8s.v1.cni.cncf.io/network-status": {},
+	"k8s.ovn.org/pod-networks":          {},
+}
+
+// managedLabelKeys are used to locate benchmark workloads and must remain under tool control.
+var managedLabelKeys = map[string]struct{}{
+	"app":  {},
+	"role": {},
+}
+
+func parseLabels(values []string) (map[string]string, error) {
+	labels := make(map[string]string, len(values))
+	for _, value := range values {
+		key, labelValue, found := strings.Cut(value, "=")
+		if !found || strings.TrimSpace(key) == "" || strings.TrimSpace(labelValue) == "" {
+			return nil, fmt.Errorf("invalid --label value %q; expected non-empty KEY=VALUE", value)
+		}
+		if validationErrors := validation.IsQualifiedName(key); len(validationErrors) != 0 {
+			return nil, fmt.Errorf("invalid --label key %q: %s", key, strings.Join(validationErrors, ", "))
+		}
+		if validationErrors := validation.IsValidLabelValue(labelValue); len(validationErrors) != 0 {
+			return nil, fmt.Errorf("invalid --label value %q: %s", labelValue, strings.Join(validationErrors, ", "))
+		}
+		if _, managed := managedLabelKeys[key]; managed {
+			return nil, fmt.Errorf("--label key %q is managed by k8s-netperf", key)
+		}
+		if _, duplicate := labels[key]; duplicate {
+			return nil, fmt.Errorf("duplicate --label key %q", key)
+		}
+		labels[key] = labelValue
+	}
+	return labels, nil
+}
+
+func parseAnnotations(values []string) (map[string]string, error) {
+	annotations := make(map[string]string, len(values))
+	for _, value := range values {
+		key, annotationValue, found := strings.Cut(value, "=")
+		if !found || strings.TrimSpace(key) == "" || strings.TrimSpace(annotationValue) == "" {
+			return nil, fmt.Errorf("invalid --annotation value %q; expected non-empty KEY=VALUE", value)
+		}
+		if validationErrors := validation.IsQualifiedName(key); len(validationErrors) != 0 {
+			return nil, fmt.Errorf("invalid --annotation key %q: %s", key, strings.Join(validationErrors, ", "))
+		}
+		if _, managed := managedAnnotationKeys[key]; managed {
+			return nil, fmt.Errorf("--annotation key %q is managed by k8s-netperf", key)
+		}
+		if _, duplicate := annotations[key]; duplicate {
+			return nil, fmt.Errorf("duplicate --annotation key %q", key)
+		}
+		annotations[key] = annotationValue
+	}
+	return annotations, nil
+}
+
+func validateWorkloadOptions(annotationValues []string, runtimeClass string, runtimeClassSet bool, launchSecurity string, launchSecuritySet bool, pod bool, vm bool, hostNetOnly bool) (map[string]string, error) {
+	annotations, err := parseAnnotations(annotationValues)
+	if err != nil {
+		return nil, err
+	}
+	if runtimeClassSet {
+		if strings.TrimSpace(runtimeClass) == "" {
+			return nil, fmt.Errorf("--runtime-class requires a non-empty value for pod workloads")
+		}
+		if !pod {
+			return nil, fmt.Errorf("--runtime-class applies to pod workloads; --pod=false disables pod execution")
+		}
+		if hostNetOnly {
+			return nil, fmt.Errorf("--runtime-class cannot be used with --hostNet; runtime classes apply only to pod-network workloads")
+		}
+	}
+	if launchSecuritySet {
+		if !vm {
+			return nil, fmt.Errorf("--launch-security applies to VM workloads; enable --vm")
+		}
+		if launchSecurity != "snp" && launchSecurity != "tdx" {
+			return nil, fmt.Errorf("invalid --launch-security value %q; supported values are snp and tdx", launchSecurity)
+		}
+	}
+	return annotations, nil
+}
+
+// validateAirGappedOptions validates complete image overrides and offline VM disk selection.
+func validateAirGappedOptions(image string, imageSet bool, vmImage string, vmImageSet bool, offlineDataVolume string, vm bool) (string, string, error) {
+	if imageSet && strings.TrimSpace(image) == "" {
+		return "", "", fmt.Errorf("--image requires a non-empty complete image reference")
+	}
+	if vmImageSet && strings.TrimSpace(vmImage) == "" {
+		return "", "", fmt.Errorf("--vm-image requires a non-empty complete image reference")
+	}
+	if offlineDataVolume == "" {
+		return "", "", nil
+	}
+	if !vm {
+		return "", "", fmt.Errorf("--offline-data-volume applies to VM workloads; enable --vm")
+	}
+	if vmImageSet {
+		return "", "", fmt.Errorf("--offline-data-volume and an explicitly selected --vm-image are mutually exclusive")
+	}
+	ns, name, found := strings.Cut(offlineDataVolume, "/")
+	if !found || strings.TrimSpace(ns) == "" || strings.TrimSpace(name) == "" || strings.Contains(name, "/") {
+		return "", "", fmt.Errorf("--offline-data-volume must use NAMESPACE/NAME")
+	}
+	return ns, name, nil
 }
 
 func applyClusterDistribution(pcon *metrics.PromConnect, distribution string) {
@@ -709,7 +863,7 @@ func shouldDiscoverPrometheus(distribution, promURL string, metadataAgentAvailab
 	}
 }
 
-func cleanup(client *kubernetes.Clientset, rconfig *rest.Config) {
+func cleanup(client *kubernetes.Clientset, rconfig *rest.Config, preserveOfflineSource bool) {
 	if cudn != "" {
 		dynClient, err := dynamic.NewForConfig(rconfig)
 		if err != nil {
@@ -741,7 +895,17 @@ func cleanup(client *kubernetes.Clientset, rconfig *rest.Config) {
 			}
 		}
 	}
-	err := k8s.DestroyNamespace(client)
+	var err error
+	if preserveOfflineSource {
+		dynClient, dynErr := dynamic.NewForConfig(rconfig)
+		if dynErr != nil {
+			log.Errorf("Skipping offline clone cleanup: failed to create dynamic client: %v", dynErr)
+		} else {
+			err = k8s.DestroyBenchmarkResources(client, dynClient)
+		}
+	} else {
+		err = k8s.DestroyNamespace(client)
+	}
 	if err != nil {
 		log.Error(err)
 		os.Exit(1)
@@ -1031,7 +1195,9 @@ func main() {
 	rootCmd.Flags().BoolVar(&nl, "local", false, "Run network performance tests with Server-Pods/Client-Pods on the same Node (default false)")
 	rootCmd.Flags().BoolVar(&pod, "pod", true, "Run tests using pods (default true)")
 	rootCmd.Flags().BoolVar(&vm, "vm", false, "Run tests using Virtual Machines (default false)")
+	rootCmd.Flags().StringVar(&image, "image", "", "Complete benchmark pod image reference")
 	rootCmd.Flags().StringVar(&vmimage, "vm-image", "quay.io/containerdisks/fedora:39", "Use specified VM image (default quay.io/containerdisks/fedora:39)")
+	rootCmd.Flags().StringVar(&offlineDataVolume, "offline-data-volume", "", "Offline VM source DataVolume in NAMESPACE/NAME")
 	rootCmd.Flags().BoolVar(&useVirtctl, "use-virtctl", false, "Use virtctl ssh for VM connections instead of traditional SSH (default false)")
 	rootCmd.Flags().Uint32Var(&sockets, "sockets", 2, "Number of Sockets for VM (default 2)")
 	rootCmd.Flags().Uint32Var(&cores, "cores", 2, "Number of cores for VM (default 2)")
@@ -1063,6 +1229,10 @@ func main() {
 	rootCmd.Flags().BoolVar(&csvArchive, "csv", true, "Archive results, cluster and benchmark metrics in CSV files (default true)")
 	rootCmd.Flags().StringVar(&serverIPAddr, "serverIP", "", "External Server IP Address")
 	rootCmd.Flags().BoolVar(&privileged, "privileged", false, "Run pods with privileged security context (default false)")
+	rootCmd.Flags().StringArrayVar(&annotations, "annotation", nil, "Add KEY=VALUE annotation to benchmark pods and VMIs (repeatable)")
+	rootCmd.Flags().StringArrayVar(&workloadLabels, "label", nil, "Add KEY=VALUE label to benchmark pods and VMIs (repeatable)")
+	rootCmd.Flags().StringVar(&runtimeClass, "runtime-class", "", "RuntimeClass for benchmark pods")
+	rootCmd.Flags().StringVar(&launchSecurity, "launch-security", "", "VM launch security mode: snp or tdx")
 	rootCmd.Flags().SortFlags = false
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
