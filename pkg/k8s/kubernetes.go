@@ -1572,6 +1572,9 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 	d, err := client.AppsV1().Deployments(dp.Namespace).Get(context.TODO(), dp.Name, metav1.GetOptions{})
 	if err == nil {
 		if d.Status.ReadyReplicas > 0 {
+			if !deploymentTemplateMetadataMatches(d, dp) {
+				return nil, fmt.Errorf("deployment %q already exists with different annotations or labels; rerun with --clean to recreate the workload", dp.Name)
+			}
 			log.Info("♻️  Using existing Deployment")
 			return d, nil
 		}
@@ -1579,6 +1582,24 @@ func CreateDeployment(dp DeploymentParams, client *kubernetes.Clientset) (*appsv
 	log.Infof("🚀 Starting Deployment for: %s in namespace: %s", dp.Name, dp.Namespace)
 	dc := client.AppsV1().Deployments(dp.Namespace)
 	return dc.Create(context.TODO(), newDeployment(dp), metav1.CreateOptions{})
+}
+
+// deploymentTemplateMetadataMatches reports whether an existing Deployment's
+// pod template already carries every requested annotation and label. Reusing a
+// Deployment whose template lacks them would silently drop --annotation/--label
+// values requested for the run.
+func deploymentTemplateMetadataMatches(d *appsv1.Deployment, dp DeploymentParams) bool {
+	for key, value := range dp.Annotations {
+		if d.Spec.Template.Annotations[key] != value {
+			return false
+		}
+	}
+	for key, value := range dp.WorkloadLabels {
+		if d.Spec.Template.Labels[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func newDeployment(dp DeploymentParams) *appsv1.Deployment {

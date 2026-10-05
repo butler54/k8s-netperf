@@ -2,6 +2,10 @@ package k8s
 
 import (
 	"testing"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestCreateDeploymentWorkloadOptions(t *testing.T) {
@@ -96,5 +100,56 @@ func TestNewDeploymentPreservesGeneratedNetworkAnnotationsWithCustomAnnotations(
 	}
 	if got := annotations["example.com/isolation"]; got != "enabled" {
 		t.Errorf("custom annotation = %q, want enabled", got)
+	}
+}
+
+func TestDeploymentTemplateMetadataMatches(t *testing.T) {
+	existing := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "workload"},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"example.com/one": "value"},
+					Labels:      map[string]string{"app": "workload", "example.com/team": "networking"},
+				},
+			},
+		},
+	}
+
+	testCases := []struct {
+		name  string
+		dp    DeploymentParams
+		match bool
+	}{
+		{name: "no requested metadata", dp: DeploymentParams{Name: "workload"}, match: true},
+		{
+			name:  "requested metadata present",
+			dp:    DeploymentParams{Name: "workload", Annotations: map[string]string{"example.com/one": "value"}, WorkloadLabels: map[string]string{"example.com/team": "networking"}},
+			match: true,
+		},
+		{
+			name: "missing annotation",
+			dp:   DeploymentParams{Name: "workload", Annotations: map[string]string{"example.com/two": "value"}},
+		},
+		{
+			name: "annotation value differs",
+			dp:   DeploymentParams{Name: "workload", Annotations: map[string]string{"example.com/one": "other"}},
+		},
+		{
+			name: "missing label",
+			dp:   DeploymentParams{Name: "workload", WorkloadLabels: map[string]string{"example.com/group": "perf"}},
+		},
+		{
+			name: "label value differs",
+			dp:   DeploymentParams{Name: "workload", WorkloadLabels: map[string]string{"example.com/team": "storage"}},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deploymentTemplateMetadataMatches(existing, tc.dp); got != tc.match {
+				t.Errorf("deploymentTemplateMetadataMatches() = %t, want %t", got, tc.match)
+			}
+		})
 	}
 }
