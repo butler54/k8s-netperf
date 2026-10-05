@@ -2051,21 +2051,50 @@ func DestroyNamespace(client *kubernetes.Clientset) error {
 // deleting the namespace. This preserves an offline source DataVolume when an
 // operator stores it in the benchmark namespace.
 func DestroyBenchmarkResources(client kubernetes.Interface, dyn dynamic.Interface) error {
+	ctx := context.TODO()
 	selector := benchmarkManagedLabel + "=true"
-	if err := client.AppsV1().Deployments(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
-		return fmt.Errorf("delete benchmark deployments: %w", err)
+
+	deployments, err := client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list benchmark deployments: %w", err)
 	}
-	if err := client.CoreV1().Services(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
-		return fmt.Errorf("delete benchmark services: %w", err)
+	deletePolicy := metav1.DeletePropagationForeground
+	for i := range deployments.Items {
+		if err := client.AppsV1().Deployments(namespace).Delete(ctx, deployments.Items[i].Name, metav1.DeleteOptions{PropagationPolicy: &deletePolicy}); err != nil {
+			return fmt.Errorf("delete benchmark deployment %s: %w", deployments.Items[i].Name, err)
+		}
 	}
-	if err := dyn.Resource(vmiGVR).Namespace(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
-		return fmt.Errorf("delete benchmark VMIs: %w", err)
+
+	services, err := client.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list benchmark services: %w", err)
 	}
-	if err := dyn.Resource(routeGVR).Namespace(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: selector}); err != nil {
-		return fmt.Errorf("delete benchmark routes: %w", err)
+	for i := range services.Items {
+		if err := client.CoreV1().Services(namespace).Delete(ctx, services.Items[i].Name, metav1.DeleteOptions{}); err != nil {
+			return fmt.Errorf("delete benchmark service %s: %w", services.Items[i].Name, err)
+		}
 	}
-	if err := dyn.Resource(dataVolumeGVR).Namespace(namespace).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: offlineCloneLabel + "=true"}); err != nil {
-		return fmt.Errorf("delete benchmark offline clone DataVolumes: %w", err)
+
+	for _, gvr := range []schema.GroupVersionResource{vmiGVR, routeGVR} {
+		if err := deleteLabeledDynamic(ctx, dyn, gvr, selector); err != nil {
+			return err
+		}
+	}
+	if err := deleteLabeledDynamic(ctx, dyn, dataVolumeGVR, offlineCloneLabel+"=true"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteLabeledDynamic(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource, selector string) error {
+	items, err := dyn.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list %s: %w", gvr.String(), err)
+	}
+	for _, item := range items.Items {
+		if err := dyn.Resource(gvr).Namespace(namespace).Delete(ctx, item.GetName(), metav1.DeleteOptions{}); err != nil {
+			return fmt.Errorf("delete %s %s: %w", gvr.Resource, item.GetName(), err)
+		}
 	}
 	return nil
 }

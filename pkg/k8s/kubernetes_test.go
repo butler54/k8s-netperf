@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -250,7 +251,12 @@ func TestDestroyBenchmarkResourcesPreservesSourceDataVolume(t *testing.T) {
 		"apiVersion": "cdi.kubevirt.io/v1beta1", "kind": "DataVolume",
 		"metadata": map[string]interface{}{"name": "clone", "namespace": namespace, "labels": map[string]interface{}{offlineCloneLabel: "true"}},
 	}}
-	dyn := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), source, clone)
+	scheme := runtime.NewScheme()
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
+		dataVolumeGVR: "DataVolumeList",
+		vmiGVR:        "VirtualMachineInstanceList",
+		routeGVR:      "RouteList",
+	}, source, clone)
 
 	if err := DestroyBenchmarkResources(client, dyn); err != nil {
 		t.Fatalf("DestroyBenchmarkResources() error = %v", err)
@@ -261,6 +267,12 @@ func TestDestroyBenchmarkResourcesPreservesSourceDataVolume(t *testing.T) {
 	if _, err := dyn.Resource(dataVolumeGVR).Namespace(namespace).Get(ctx, "clone", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Errorf("clone DataVolume lookup error = %v, want not found", err)
 	}
+	if _, err := client.AppsV1().Deployments(namespace).Get(ctx, "benchmark", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("managed Deployment lookup error = %v, want not found", err)
+	}
+	if _, err := client.CoreV1().Services(namespace).Get(ctx, "benchmark", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("managed Service lookup error = %v, want not found", err)
+	}
 	if _, err := client.AppsV1().Deployments(namespace).Get(ctx, "operator-workload", metav1.GetOptions{}); err != nil {
 		t.Errorf("unmanaged Deployment was deleted: %v", err)
 	}
@@ -268,7 +280,6 @@ func TestDestroyBenchmarkResourcesPreservesSourceDataVolume(t *testing.T) {
 		t.Errorf("unmanaged Service was deleted: %v", err)
 	}
 }
-
 func TestNewDeploymentPreservesGeneratedNetworkAnnotationsWithCustomAnnotations(t *testing.T) {
 	params := DeploymentParams{
 		Name:               "workload",
